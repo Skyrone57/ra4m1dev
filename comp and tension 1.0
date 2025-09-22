@@ -1,0 +1,162 @@
+// hal_entry.c
+#include "hal_data.h"
+#include "bsp_pin_cfg.h"   // for g_bsp_pin_cfg
+
+/************** Pin aliases (match Pins tab) **************/
+#define HX_DOUT_PIN        BSP_IO_PORT_04_PIN_10   // P410: HX711 DOUT (input)
+#define HX_SCK_PIN         BSP_IO_PORT_04_PIN_11   // P411: HX711 PD_SCK (output, idle LOW)
+#define OUT_TENSION_PIN    BSP_IO_PORT_01_PIN_04   // P104: HIGH on TENSION
+#define OUT_COMPRESSION_PIN BSP_IO_PORT_01_PIN_00  // P100: HIGH on COMPRESSION
+/************** Tuning knobs **************/
+#define NEXT_PULSES          25          // 25=A,128 | 26=B,32 | 27=A,64
+#define TARE_SAMPLES         8
+#define AVG_SAMPLES          4
+#define THRESH_TENSION       15000       // counts above baseline to call "tension"
+#define THRESH_COMPRESSION   15000       // counts below baseline to call "compression"
+#define HYST_TENSION         2000        // hysteresis for tension output
+#define HYST_COMPRESSION     2000        // hysteresis for compression output
+
+/************** IO helpers **************/
+static inline void io_write(bsp_io_port_pin_t pin, bsp_io_level_t lvl)
+{ R_IOPORT_PinWrite(&g_ioport_ctrl, pin, lvl); }
+
+static inline bsp_io_level_t io_read(bsp_io_port_pin_t pin)
+{
+    bsp_io_level_t lvl;
+    R_IOPORT_PinRead(&g_ioport_ctrl, pin, &lvl);
+    return lvl;
+}
+
+/************** HX711 state (GPT ISR) **************/
+typedef enum { HX_IDLE, HX_SHIFTING } hx_state_t;
+static volatile hx_state_t g_state = HX_IDLE;
+static volatile bool       g_sck_high = false;
+static volatile uint32_t   g_pulses = 0;
+static volatile uint32_t   g_bits = 0;
+static volatile int32_t    g_value = 0;
+static volatile bool       g_done = false;
+static volatile uint32_t   g_target_pulses = NEXT_PULSES;
+
+/************** GPT ISR: 1 µs tick **************/
+void gpt0_callback(timer_callback_args_t * p_args)
+{
+    FSP_PARAMETER_NOT_USED(p_args);
+    if (g_state != HX_SHIFTING) return;
+
+    if (!g_sck_high) {
+        io_write(HX_SCK_PIN, BSP_IO_LEVEL_HIGH);
+        g_sck_high = true;
+
+        if (g_pulses < 24) {
+            g_value = (g_value << 1) | (io_read(HX_DOUT_PIN) ? 1 : 0);
+            g_bits++;
+        }
+    } else {
+        io_write(HX_SCK_PIN, BSP_IO_LEVEL_LOW);
+        g_sck_high = false;
+
+        g_pulses++;
+        if (g_pulses >= g_target_pulses) {
+            R_GPT_Stop(&g_timer0_ctrl);
+            g_state = HX_IDLE;
+            g_done  = true;
+        }
+    }
+}
+
+/************** Wait for data-ready (DOUT=LOW) **************/
+static bool hx_wait_ready(uint32_t timeout_ms)
+{
+    uint32_t tries = (timeout_ms * 1000U) / 10U;
+    if (tries == 0) tries = 1;
+
+    while (io_read(HX_DOUT_PIN) == BSP_IO_LEVEL_HIGH) {
+        if (tries-- == 0) return false;
+        R_BSP_SoftwareDelay(10, BSP_DELAY_UNITS_MICROSECONDS);
+    }
+    return true;
+}
+
+/************** One HX711 read (24b + next-pulses) **************/
+static bool hx_read_once(int32_t *out, uint32_t next_pulses)
+{
+    if (!hx_wait_ready(100)) return false;
+
+    g_target_pulses = next_pulses;
+    g_pulses = 0; g_bits = 0; g_value = 0;
+    g_done = false; g_sck_high = false; g_state = HX_SHIFTING;
+
+    if (R_GPT_Start(&g_timer0_ctrl) != FSP_SUCCESS) return false;
+
+    while (!g_done) { __WFI(); }
+
+    int32_t v = g_value;
+    if (v & 0x800000) v |= 0xFF000000;   // sign-extend 24-bit two's complement
+    *out = v;
+    return (g_bits == 24);
+}
+
+static bool hx_read_avg(int32_t *out, uint32_t n, uint32_t next_pulses)
+{
+    int64_t acc = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t v;
+        if (!hx_read_once(&v, next_pulses)) return false;
+        acc += v;
+    }
+    *out = (int32_t)(acc / (int32_t)n);
+    return true;
+}
+
+/************** Main **************/
+void hal_entry(void)
+{
+    R_IOPORT_Open(&g_ioport_ctrl, &g_bsp_pin_cfg);
+
+    // ensure outputs low at start
+    io_write(HX_SCK_PIN,          BSP_IO_LEVEL_LOW);
+    io_write(OUT_TENSION_PIN,     BSP_IO_LEVEL_LOW);
+    io_write(OUT_COMPRESSION_PIN, BSP_IO_LEVEL_LOW);
+
+    R_GPT_Open(&g_timer0_ctrl, &g_timer0_cfg);
+
+    // Tare / baseline
+    int32_t baseline;
+    (void) hx_read_avg(&baseline, TARE_SAMPLES, NEXT_PULSES);
+    (void) hx_read_avg(&baseline, TARE_SAMPLES, NEXT_PULSES);
+
+    bool tension_on = false;
+    bool compression_on = false;
+
+    while (1)
+    {
+        int32_t reading;
+        if (hx_read_avg(&reading, AVG_SAMPLES, NEXT_PULSES))
+        {
+            // Positive delta => tension; Negative delta => compression
+            int32_t delta = reading - baseline;
+
+            // --- Tension output on P104 ---
+            if (!tension_on && (delta >= THRESH_TENSION)) {
+                tension_on = true;
+                io_write(OUT_TENSION_PIN, BSP_IO_LEVEL_HIGH);
+            } else if (tension_on && (delta <= (THRESH_TENSION - HYST_TENSION))) {
+                tension_on = false;
+                io_write(OUT_TENSION_PIN, BSP_IO_LEVEL_LOW);
+            }
+
+            // --- Compression output on P100 ---
+            int32_t comp_mag = -delta;  // make compression magnitude positive
+            if (!compression_on && (comp_mag >= THRESH_COMPRESSION)) {
+                compression_on = true;
+                io_write(OUT_COMPRESSION_PIN, BSP_IO_LEVEL_HIGH);
+            } else if (compression_on && (comp_mag <= (THRESH_COMPRESSION - HYST_COMPRESSION))) {
+                compression_on = false;
+                io_write(OUT_COMPRESSION_PIN, BSP_IO_LEVEL_LOW);
+            }
+        }
+
+        // HX711 output rate is 10–80 SPS; this pacing is fine
+        R_BSP_SoftwareDelay(2, BSP_DELAY_UNITS_MILLISECONDS);
+    }
+}
