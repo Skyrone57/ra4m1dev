@@ -1,0 +1,152 @@
+// hal_entry.c — Buttons on P111/P112 adjust P104 pulse width (uses GPT2 1ms tick)
+#include "hal_data.h"
+#include "bsp_pin_cfg.h"   // ensure Pins tab matches these GPIOs
+
+/************** Pins **************/
+#define OUT_TENSION_PIN   BSP_IO_PORT_01_PIN_04   // P104: output we pulse
+#define BTN_DEC_PIN       BSP_IO_PORT_01_PIN_11   // P111: momentary to GND -> -5 ms
+#define BTN_INC_PIN       BSP_IO_PORT_01_PIN_12   // P112: momentary to GND -> +5 ms
+
+/************** Pulse tuning **************/
+#define PULSE_STEP_MS             5
+#define PULSE_MIN_MS              5
+#define PULSE_MAX_MS           1000
+#define PULSE_DEFAULT_MS        100
+
+/************** Helpers **************/
+static inline void io_write(bsp_io_port_pin_t pin, bsp_io_level_t lvl)
+{ R_IOPORT_PinWrite(&g_ioport_ctrl, pin, lvl); }
+
+static inline bsp_io_level_t io_read(bsp_io_port_pin_t pin)
+{
+    bsp_io_level_t lvl;
+    R_IOPORT_PinRead(&g_ioport_ctrl, pin, &lvl);
+    return lvl;
+}
+
+/************** 1 ms system tick (GPT2) **************/
+static volatile uint32_t g_ms_tick = 0;
+
+void gpt2_callback(timer_callback_args_t * p_args)
+{
+    FSP_PARAMETER_NOT_USED(p_args);
+    g_ms_tick++;                // debouncing + pulse timing
+}
+
+/************** Pulse state machine **************/
+typedef enum { PULSE_IDLE, PULSE_ACTIVE } pulse_state_t;
+
+typedef struct {
+    pulse_state_t state;
+    uint32_t end_time_ms;
+} pulse_timer_t;
+
+static pulse_timer_t tension_pulse = { PULSE_IDLE, 0 };
+static volatile uint32_t g_pulse_ms_tension = PULSE_DEFAULT_MS;
+
+static void pulse_start(pulse_timer_t *pulse, bsp_io_port_pin_t pin, uint32_t duration_ms)
+{
+    pulse->state = PULSE_ACTIVE;
+    pulse->end_time_ms = g_ms_tick + duration_ms;
+    io_write(pin, BSP_IO_LEVEL_HIGH);
+}
+
+static void pulse_update(pulse_timer_t *pulse, bsp_io_port_pin_t pin)
+{
+    if (pulse->state == PULSE_ACTIVE)
+    {
+        if ((int32_t)(g_ms_tick - pulse->end_time_ms) >= 0)
+        {
+            io_write(pin, BSP_IO_LEVEL_LOW);
+            pulse->state = PULSE_IDLE;
+        }
+    }
+}
+
+/************** Button handling (debounced, active-LOW) **************/
+typedef struct {
+    bsp_io_port_pin_t pin;
+    bool last_level_high;     // last sampled (true = HIGH)
+    uint32_t last_edge_ms;    // for debounce
+} button_t;
+
+static button_t g_btn_inc = { BTN_INC_PIN, true, 0 };
+static button_t g_btn_dec = { BTN_DEC_PIN, true, 0 };
+
+#define DEBOUNCE_MS 30
+
+// Returns true exactly once per valid falling edge (press)
+static bool button_pressed(button_t *b)
+{
+    bool level_high_now = (io_read(b->pin) == BSP_IO_LEVEL_HIGH);
+    bool was_low = !b->last_level_high;
+    bool now_low = !level_high_now;
+
+    bool pressed = false;
+    if (now_low && !was_low)
+    {
+        if ((g_ms_tick - b->last_edge_ms) >= DEBOUNCE_MS)
+        {
+            pressed = true;
+            b->last_edge_ms = g_ms_tick;
+        }
+    }
+    b->last_level_high = level_high_now;
+    return pressed;
+}
+
+/************** Main **************/
+void hal_entry(void)
+{
+    /* Init IOPORT */
+    R_IOPORT_Open(&g_ioport_ctrl, &g_bsp_pin_cfg);
+
+    /* Ensure output low at start */
+    io_write(OUT_TENSION_PIN, BSP_IO_LEVEL_LOW);
+
+    /* Configure buttons as GPIO input + internal pull-up (belt-and-suspenders) */
+    R_IOPORT_PinCfg(&g_ioport_ctrl, BTN_INC_PIN,
+        IOPORT_CFG_PORT_DIRECTION_INPUT | IOPORT_CFG_PULLUP_ENABLE);
+    R_IOPORT_PinCfg(&g_ioport_ctrl, BTN_DEC_PIN,
+        IOPORT_CFG_PORT_DIRECTION_INPUT | IOPORT_CFG_PULLUP_ENABLE);
+
+    /* Start GPT2 as 1 ms tick (must exist in FSP as g_timer2 with callback gpt2_callback) */
+    R_GPT_Open(&g_timer2_ctrl, &g_timer2_cfg);
+    R_GPT_Start(&g_timer2_ctrl);
+
+    /* 1 Hz test pulse generator so width changes are visible on a scope */
+    uint32_t next_test_ms = 0;
+
+    while (1)
+    {
+        /* Adjust width with buttons (each valid press changes by 5 ms) */
+        if (button_pressed(&g_btn_inc))
+        {
+            uint32_t v = g_pulse_ms_tension + PULSE_STEP_MS;
+            if (v > PULSE_MAX_MS) v = PULSE_MAX_MS;
+            g_pulse_ms_tension = v;
+        }
+        if (button_pressed(&g_btn_dec))
+        {
+            int32_t v = (int32_t)g_pulse_ms_tension - (int32_t)PULSE_STEP_MS;
+            if (v < (int32_t)PULSE_MIN_MS) v = (int32_t)PULSE_MIN_MS;
+            g_pulse_ms_tension = (uint32_t)v;
+        }
+
+        /* Fire a pulse every 1000 ms so you can measure width on P104 */
+        if ((int32_t)(g_ms_tick - next_test_ms) >= 0)
+        {
+            if (tension_pulse.state == PULSE_IDLE)
+            {
+                pulse_start(&tension_pulse, OUT_TENSION_PIN, g_pulse_ms_tension);
+            }
+            next_test_ms = g_ms_tick + 1000;
+        }
+
+        /* End pulse when its duration elapses */
+        pulse_update(&tension_pulse, OUT_TENSION_PIN);
+
+        /* Small idle delay (optional) */
+        R_BSP_SoftwareDelay(1, BSP_DELAY_UNITS_MILLISECONDS);
+    }
+}
